@@ -30,9 +30,9 @@ You need one computer to act as the server.
    ```
 
 2. **Run the server:**
-   Replace `5000` with any port you like.
+   Replace `9000` with any port you like.
    ```bash
-   python3 server.py 5000
+   python3 server.py 9000
    ```
 
 #### Run as a Background Service
@@ -40,7 +40,7 @@ To keep the server running automatically (even after reboot), use the included s
 
 ```bash
 # Usage: sudo ./scripts/add_server_systemd_service.sh <PORT>
-sudo ./scripts/add_server_systemd_service.sh 5000
+sudo ./scripts/add_server_systemd_service.sh 9000
 ```
 
 Then start it:
@@ -69,7 +69,7 @@ Every person watching needs to run the client.
 
    **Example:**
    ```bash
-   python3 client.py Alice 192.168.1.50 5000
+   python3 client.py Alice 192.168.1.50 9000
    ```
 
    *Note: On the first run, it will automatically install a small script into VLC. You don't need to do anything else.*
@@ -90,7 +90,7 @@ You can potentiall save your details here so you don't have to type them every t
 {
   "username": "Alice",
   "server_ip": "1.2.3.4",
-  "port": 5000,
+  "port": 9000,
   "lua_port": null
 }
 ```
