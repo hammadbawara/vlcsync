@@ -12,6 +12,8 @@ from typing import Any
 
 from vlcsync.common import (
     BURST_READ_TIMEOUT_SECONDS,
+    CLIENT_HEARTBEAT_INTERVAL_SECONDS,
+    CLIENT_HEARTBEAT_TIMEOUT_SECONDS,
     CLIENT_RECONNECT_BACKOFF_MULTIPLIER,
     CLIENT_RECONNECT_INITIAL_BACKOFF_SECONDS,
     CLIENT_RECONNECT_MAX_BACKOFF_SECONDS,
@@ -234,6 +236,8 @@ class SyncClient:
         self.last_state: str | None = None
         self.last_position: float | None = None
         self.suppress_until = 0.0
+        self.last_server_message_at = 0.0
+        self.server_send_lock = asyncio.Lock()
 
     @staticmethod
     def _utc_ms_now() -> int:
@@ -339,9 +343,18 @@ class SyncClient:
             print(f"[client] Client id: {self.client_id}")
             print(f"[client] Current connected users: {msg.get('users')}")
             print(f"[client] Replayed events after reconnect: {msg.get('replayed', 0)}")
+            self.last_server_message_at = now_seconds()
             self.connected_event.set()
         else:
             raise RuntimeError("invalid welcome from server")
+
+    def _mark_server_message(self) -> None:
+        self.last_server_message_at = now_seconds()
+
+    def _seconds_since_server_message(self) -> float:
+        if self.last_server_message_at <= 0:
+            return 0.0
+        return max(0.0, now_seconds() - self.last_server_message_at)
 
     async def _send_to_server_with_retry(
         self,
@@ -353,16 +366,22 @@ class SyncClient:
             print("[client] send failed: not connected to server")
             return False
 
-        return await send_json_with_retry(
-            self.server_writer,
-            payload,
-            retries=retries,
-            delay_seconds=delay_seconds,
-            compact=False,
-            on_error=lambda exc, attempt, total: print(
-                f"[client] send attempt {attempt}/{total} failed: {exc}"
-            ),
-        )
+        async with self.server_send_lock:
+            writer = self.server_writer
+            if writer is None:
+                print("[client] send failed: not connected to server")
+                return False
+
+            return await send_json_with_retry(
+                writer,
+                payload,
+                retries=retries,
+                delay_seconds=delay_seconds,
+                compact=False,
+                on_error=lambda exc, attempt, total: print(
+                    f"[client] send attempt {attempt}/{total} failed: {exc}"
+                ),
+            )
 
     async def send_event(self, event: str, position: float | None, playback_state: str) -> None:
         payload = {
@@ -444,6 +463,22 @@ class SyncClient:
         if msg_type == "user_count":
             print(f"[client] Connected users: {msg.get('count')}")
 
+    async def keepalive_loop(self) -> None:
+        while not self.stop_event.is_set():
+            await self.connected_event.wait()
+
+            silent_for = self._seconds_since_server_message()
+            if silent_for > CLIENT_HEARTBEAT_TIMEOUT_SECONDS:
+                raise RuntimeError(
+                    f"server heartbeat timeout after {silent_for:.1f}s of silence"
+                )
+
+            ok = await self._send_to_server_with_retry({"type": "heartbeat", "ts": self._utc_ms_now()})
+            if not ok:
+                raise RuntimeError("failed sending heartbeat to server")
+
+            await asyncio.sleep(CLIENT_HEARTBEAT_INTERVAL_SECONDS)
+
     async def _read_latest_sync_from_burst(self, first_sync: dict) -> dict:
         if self.server_reader is None:
             return first_sync
@@ -483,6 +518,8 @@ class SyncClient:
                 msg = json.loads(line.decode("utf-8").strip())
             except json.JSONDecodeError:
                 continue
+
+            self._mark_server_message()
 
             msg_type = msg.get("type")
             if msg_type == "sync":
@@ -526,15 +563,39 @@ class SyncClient:
     async def connection_supervisor(self) -> None:
         backoff = CLIENT_RECONNECT_INITIAL_BACKOFF_SECONDS
         while not self.stop_event.is_set():
+            listener_task: asyncio.Task | None = None
+            keepalive_task: asyncio.Task | None = None
             try:
                 await self.connect_server()
                 backoff = CLIENT_RECONNECT_INITIAL_BACKOFF_SECONDS
-                await self.server_listener()
+                listener_task = asyncio.create_task(self.server_listener())
+                keepalive_task = asyncio.create_task(self.keepalive_loop())
+                done, pending = await asyncio.wait(
+                    {listener_task, keepalive_task},
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 print(f"[client] server connection lost/error: {exc}")
             finally:
+                for task in (listener_task, keepalive_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(task for task in (listener_task, keepalive_task) if task is not None),
+                    return_exceptions=True,
+                )
                 await self._close_server_connection()
 
             if self.stop_event.is_set():

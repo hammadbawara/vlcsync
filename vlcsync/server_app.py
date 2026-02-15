@@ -274,7 +274,19 @@ class SyncServer:
                     print(f"[recv] invalid json from {username} id={client_id}")
                     continue
 
-                if msg.get("type") != "event":
+                async with self.lock:
+                    session = self.sessions.get(client_id)
+                    if session is not None:
+                        session.last_seen = self._now()
+
+                msg_type = msg.get("type")
+                if msg_type == "heartbeat":
+                    ok = await self.send(writer, {"type": "heartbeat_ack", "ts": utc_ms_now()})
+                    if not ok:
+                        raise ConnectionError("failed to send heartbeat_ack")
+                    continue
+
+                if msg_type != "event":
                     continue
 
                 event = msg.get("event")
