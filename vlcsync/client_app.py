@@ -12,6 +12,7 @@ from typing import Any
 
 from vlcsync.common import (
     BURST_READ_TIMEOUT_SECONDS,
+    CLIENT_EVENT_ACK_TIMEOUT_SECONDS,
     CLIENT_HEARTBEAT_INTERVAL_SECONDS,
     CLIENT_HEARTBEAT_TIMEOUT_SECONDS,
     CLIENT_RECONNECT_BACKOFF_MULTIPLIER,
@@ -238,6 +239,8 @@ class SyncClient:
         self.suppress_until = 0.0
         self.last_server_message_at = 0.0
         self.server_send_lock = asyncio.Lock()
+        self.next_local_event_id = 1
+        self.pending_event_acks: dict[str, asyncio.Event] = {}
 
     @staticmethod
     def _utc_ms_now() -> int:
@@ -384,8 +387,11 @@ class SyncClient:
             )
 
     async def send_event(self, event: str, position: float | None, playback_state: str) -> None:
+        event_id = f"{self.client_id}:{self.next_local_event_id}"
+        self.next_local_event_id += 1
         payload = {
             "type": "event",
+            "event_id": event_id,
             "event": event,
             "position": position,
             "playback_state": playback_state,
@@ -395,7 +401,7 @@ class SyncClient:
             self.outbound_queue.put_nowait(payload)
             print(
                 f"[local->queue] event={event} pos={position} "
-                f"state={playback_state} event_utc_ms={payload['event_utc_ms']}"
+                f"state={playback_state} event_utc_ms={payload['event_utc_ms']} id={event_id}"
             )
         except asyncio.QueueFull:
             print("[local->queue] outbound queue full, dropping oldest event")
@@ -462,6 +468,13 @@ class SyncClient:
         msg_type = msg.get("type")
         if msg_type == "user_count":
             print(f"[client] Connected users: {msg.get('count')}")
+        elif msg_type == "event_ack":
+            event_id = str(msg.get("event_id", "")).strip()
+            if event_id:
+                ack_event = self.pending_event_acks.get(event_id)
+                if ack_event is not None:
+                    ack_event.set()
+                print(f"[client] ack received event_id={event_id} seq={msg.get('seq')}")
 
     async def keepalive_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -544,20 +557,40 @@ class SyncClient:
     async def sender_loop(self) -> None:
         while not self.stop_event.is_set():
             payload = await self.outbound_queue.get()
+            event_id = str(payload.get("event_id", "")).strip()
+            ack_event: asyncio.Event | None = None
+            if event_id:
+                ack_event = self.pending_event_acks.setdefault(event_id, asyncio.Event())
             try:
                 while not self.stop_event.is_set():
                     await self.connected_event.wait()
                     ok = await self._send_to_server_with_retry(payload)
                     if ok:
-                        print(
-                            f"[queue->server] sent event={payload.get('event')} pos={payload.get('position')}"
-                        )
-                        break
+                        print(f"[queue->server] sent event={payload.get('event')} pos={payload.get('position')} id={event_id}")
+
+                        if ack_event is None:
+                            break
+
+                        try:
+                            await asyncio.wait_for(
+                                ack_event.wait(),
+                                timeout=CLIENT_EVENT_ACK_TIMEOUT_SECONDS,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            print(
+                                f"[queue->server] ack timeout for event_id={event_id}; forcing reconnect and retry"
+                            )
+                            await self._close_server_connection()
+                            await asyncio.sleep(0.2)
+                            continue
 
                     print("[queue->server] send failed, waiting for reconnect")
                     self.connected_event.clear()
                     await asyncio.sleep(1.0)
             finally:
+                if event_id:
+                    self.pending_event_acks.pop(event_id, None)
                 self.outbound_queue.task_done()
 
     async def connection_supervisor(self) -> None:

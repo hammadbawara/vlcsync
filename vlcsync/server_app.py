@@ -36,6 +36,7 @@ class SyncServer:
         self.sessions: dict[str, Session] = {}
         self.writer_to_client_id: dict[asyncio.StreamWriter, str] = {}
         self.event_log: list[dict] = []
+        self.event_receipts: dict[tuple[str, str], dict[str, int | float]] = {}
         self.next_seq = 1
         self.lock = asyncio.Lock()
 
@@ -71,6 +72,9 @@ class SyncServer:
     def _prune_event_log(self) -> None:
         cutoff = self._now() - self.EVENT_TTL_SECONDS
         self.event_log = [entry for entry in self.event_log if entry["ts"] >= cutoff]
+        self.event_receipts = {
+            key: receipt for key, receipt in self.event_receipts.items() if receipt["ts"] >= cutoff
+        }
 
     async def _prune_sessions(self) -> None:
         cutoff = self._now() - self.session_ttl_seconds
@@ -293,6 +297,26 @@ class SyncServer:
                 if event not in {"play", "pause", "seek"}:
                     continue
 
+                event_id = str(msg.get("event_id", "")).strip()
+                if event_id:
+                    duplicate_seq = None
+                    async with self.lock:
+                        receipt = self.event_receipts.get((client_id, event_id))
+                        if receipt is not None:
+                            duplicate_seq = int(receipt["seq"])
+                    if duplicate_seq is not None:
+                        ok = await self.send(
+                            writer,
+                            {
+                                "type": "event_ack",
+                                "event_id": event_id,
+                                "seq": duplicate_seq,
+                            },
+                        )
+                        if not ok:
+                            raise ConnectionError("failed to send duplicate event_ack")
+                        continue
+
                 position = msg.get("position")
                 playback_state = msg.get("playback_state")
                 try:
@@ -318,6 +342,7 @@ class SyncServer:
                 payload = {
                     "type": "sync",
                     "event": event,
+                    "event_id": event_id,
                     "position": position,
                     "playback_state": playback_state,
                     "event_utc_ms": event_utc_ms,
@@ -328,6 +353,25 @@ class SyncServer:
                     "seq": seq,
                 }
                 self.event_log.append({"ts": self._now(), "payload": payload})
+                if event_id:
+                    async with self.lock:
+                        self.event_receipts[(client_id, event_id)] = {
+                            "seq": seq,
+                            "ts": self._now(),
+                        }
+
+                if event_id:
+                    ok = await self.send(
+                        writer,
+                        {
+                            "type": "event_ack",
+                            "event_id": event_id,
+                            "seq": seq,
+                        },
+                    )
+                    if not ok:
+                        raise ConnectionError("failed to send event_ack")
+
                 self._prune_event_log()
                 await self.broadcast(payload)
 
