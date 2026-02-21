@@ -72,7 +72,16 @@ Every person watching needs to run the client.
    python3 client.py Alice 192.168.1.50 9000
    ```
 
-   *Note: On the first run, it will automatically install a small script into VLC. You don't need to do anything else.*
+   *Note: On the first run, it automatically installs a small Lua script into VLC.*
+   Install location by platform:
+   - Linux: `~/.local/share/vlc/lua/intf` (or Flatpak: `~/.var/app/org.videolan.VLC/data/vlc/lua/intf`)
+   - macOS: `~/Library/Application Support/org.videolan.vlc/lua/intf`
+   - Windows: `%APPDATA%\vlc\lua\intf`
+
+   You can override the target directory by setting:
+   ```bash
+   export VLCSYNC_VLC_LUA_DIR="/custom/path/to/vlc/lua/intf"
+   ```
 
 3. **Watch Together:**
    VLC will open automatically. Open your video file, and when you Play/Pause/Seek, it will sync with everyone else!

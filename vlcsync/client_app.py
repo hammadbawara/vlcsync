@@ -3,6 +3,7 @@ import asyncio
 import configparser
 import json
 import os
+import platform
 import shutil
 import signal
 import socket
@@ -299,14 +300,46 @@ class SyncClient:
     def _seq_of(msg: dict) -> int:
         return seq_of(msg)
 
+    @staticmethod
+    def _vlc_lua_interface_dir_candidates() -> list[Path]:
+        override_dir = os.environ.get("VLCSYNC_VLC_LUA_DIR", "").strip()
+        if override_dir:
+            return [Path(override_dir).expanduser()]
+
+        home_dir = Path.home()
+        system_name = platform.system().lower()
+
+        if system_name == "windows":
+            appdata_dir = os.environ.get("APPDATA", "").strip()
+            if appdata_dir:
+                return [Path(appdata_dir) / "vlc" / "lua" / "intf"]
+            return [home_dir / "AppData" / "Roaming" / "vlc" / "lua" / "intf"]
+
+        if system_name == "darwin":
+            return [home_dir / "Library" / "Application Support" / "org.videolan.vlc" / "lua" / "intf"]
+
+        return [
+            home_dir / ".local" / "share" / "vlc" / "lua" / "intf",
+            home_dir / ".var" / "app" / "org.videolan.VLC" / "data" / "vlc" / "lua" / "intf",
+        ]
+
+    @classmethod
+    def _resolve_vlc_lua_interface_dir(cls) -> Path:
+        candidates = cls._vlc_lua_interface_dir_candidates()
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
     def install_lua_script(self) -> Path:
         source = Path(__file__).resolve().parent.parent / "vlcsync.lua"
         if not source.exists():
             raise RuntimeError(f"Lua script not found at {source}")
-        target_dir = Path.home() / ".local/share/vlc/lua/intf"
+        target_dir = self._resolve_vlc_lua_interface_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / "vlcsync.lua"
         shutil.copy2(source, target)
+        logger.info(f"[client] installed VLC lua interface script to {target}")
         return target
 
     @staticmethod
