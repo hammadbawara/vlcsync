@@ -9,6 +9,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+import logging
+
+from vlcsync.logger import setup_logger
 
 from vlcsync.common import (
     BURST_READ_TIMEOUT_SECONDS,
@@ -40,6 +43,8 @@ from vlcsync.common import (
     seq_of,
     utc_ms_now,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -96,8 +101,9 @@ def load_or_create_client_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         defaults = _default_config()
         config_path.write_text(json.dumps(defaults, indent=2) + "\n", encoding="utf-8")
-        print(f"[config] created default config at {config_path}")
-        print("[config] server_ip and port are null by default; set them in config or pass CLI args")
+        config_path.write_text(json.dumps(defaults, indent=2) + "\n", encoding="utf-8")
+        logger.info(f"[config] created default config at {config_path}")
+        logger.info("[config] server_ip and port are null by default; set them in config or pass CLI args")
         return defaults
 
     try:
@@ -140,7 +146,7 @@ def _resolve_runtime_value(
         return option_value
     if positional_value is not None:
         return positional_value
-    print(f"[config] using {field} from {config_path}: {config_value}")
+    logger.info(f"[config] using {field} from {config_path}: {config_value}")
     return config_value
 
 
@@ -308,7 +314,7 @@ class SyncClient:
             f"vlcsync={{port={self.lua_port}}}",
         ]
         self.vlc_process = subprocess.Popen(cmd)
-        print(f"[client] VLC launched (Lua port {self.lua_port})")
+        logger.info(f"[client] VLC launched (Lua port {self.lua_port})")
 
     async def _close_server_connection(self) -> None:
         writer = self.server_writer
@@ -320,10 +326,10 @@ class SyncClient:
                 writer.close()
                 await writer.wait_closed()
             except Exception as exc:
-                print(f"[client] close connection error: {exc}")
+                logger.error(f"[client] close connection error: {exc}")
 
     async def connect_server(self) -> None:
-        print(f"[client] connecting to server {self.server_ip}:{self.port}")
+        logger.info(f"[client] connecting to server {self.server_ip}:{self.port}")
         self.server_reader, self.server_writer = await asyncio.wait_for(
             asyncio.open_connection(self.server_ip, self.port),
             timeout=SERVER_CONNECT_TIMEOUT_SECONDS,
@@ -342,10 +348,11 @@ class SyncClient:
             raise RuntimeError("server closed connection during handshake")
         msg = json.loads(first.decode("utf-8").strip())
         if msg.get("type") == "welcome":
-            print(f"[client] Connected to server {self.server_ip}:{self.port}")
-            print(f"[client] Client id: {self.client_id}")
-            print(f"[client] Current connected users: {msg.get('users')}")
-            print(f"[client] Replayed events after reconnect: {msg.get('replayed', 0)}")
+            logger.info(f"[client] Connected to server {self.server_ip}:{self.port}")
+            logger.info(f"[client] Client id: {self.client_id}")
+            logger.info(f"[client] Current connected users: {msg.get('users')}")
+            logger.info(f"[client] Replayed events after reconnect: {msg.get('replayed', 0)}")
+            logger.info(f"[client] Replayed events after reconnect: {msg.get('replayed', 0)}")
             self.last_server_message_at = now_seconds()
             self.connected_event.set()
         else:
@@ -366,13 +373,13 @@ class SyncClient:
         delay_seconds: float = CLIENT_SEND_RETRY_DELAY_SECONDS,
     ) -> bool:
         if self.server_writer is None:
-            print("[client] send failed: not connected to server")
+            logger.error("[client] send failed: not connected to server")
             return False
 
         async with self.server_send_lock:
             writer = self.server_writer
             if writer is None:
-                print("[client] send failed: not connected to server")
+                logger.error("[client] send failed: not connected to server")
                 return False
 
             return await send_json_with_retry(
@@ -381,7 +388,7 @@ class SyncClient:
                 retries=retries,
                 delay_seconds=delay_seconds,
                 compact=False,
-                on_error=lambda exc, attempt, total: print(
+                on_error=lambda exc, attempt, total: logger.warning(
                     f"[client] send attempt {attempt}/{total} failed: {exc}"
                 ),
             )
@@ -399,12 +406,12 @@ class SyncClient:
         }
         try:
             self.outbound_queue.put_nowait(payload)
-            print(
+            logger.debug(
                 f"[local->queue] event={event} pos={position} "
                 f"state={playback_state} event_utc_ms={payload['event_utc_ms']} id={event_id}"
             )
         except asyncio.QueueFull:
-            print("[local->queue] outbound queue full, dropping oldest event")
+            logger.warning("[local->queue] outbound queue full, dropping oldest event")
             try:
                 _ = self.outbound_queue.get_nowait()
                 self.outbound_queue.task_done()
@@ -441,7 +448,9 @@ class SyncClient:
         if position is not None and event in {"play", "seek"} and playback_state == "playing":
             compensated_position = position + latency_seconds
 
-        print(
+            compensated_position = position + latency_seconds
+
+        logger.info(
             f"[server->{self.username}] seq={seq_num} event={event} by={by} "
             f"pos={position} compensated={compensated_position} latency={latency_seconds:.3f}s"
         )
@@ -467,14 +476,16 @@ class SyncClient:
     async def _handle_non_sync_message(self, msg: dict) -> None:
         msg_type = msg.get("type")
         if msg_type == "user_count":
-            print(f"[client] Connected users: {msg.get('count')}")
+            logger.info(f"[client] Connected users: {msg.get('count')}")
         elif msg_type == "event_ack":
             event_id = str(msg.get("event_id", "")).strip()
             if event_id:
                 ack_event = self.pending_event_acks.get(event_id)
                 if ack_event is not None:
                     ack_event.set()
-                print(f"[client] ack received event_id={event_id} seq={msg.get('seq')}")
+                if ack_event is not None:
+                    ack_event.set()
+                logger.debug(f"[client] ack received event_id={event_id} seq={msg.get('seq')}")
 
     async def keepalive_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -550,7 +561,7 @@ class SyncClient:
                     if seq_num > 0:
                         self.last_applied_seq = max(self.last_applied_seq, seq_num)
                 except Exception as exc:
-                    print(f"[client] failed applying remote event seq={seq_num}: {exc}")
+                    logger.error(f"[client] failed applying remote event seq={seq_num}: {exc}")
             else:
                 await self._handle_non_sync_message(msg)
 
@@ -566,7 +577,7 @@ class SyncClient:
                     await self.connected_event.wait()
                     ok = await self._send_to_server_with_retry(payload)
                     if ok:
-                        print(f"[queue->server] sent event={payload.get('event')} pos={payload.get('position')} id={event_id}")
+                        logger.info(f"[queue->server] sent event={payload.get('event')} pos={payload.get('position')} id={event_id}")
 
                         if ack_event is None:
                             break
@@ -578,14 +589,14 @@ class SyncClient:
                             )
                             break
                         except asyncio.TimeoutError:
-                            print(
+                            logger.warning(
                                 f"[queue->server] ack timeout for event_id={event_id}; forcing reconnect and retry"
                             )
                             await self._close_server_connection()
                             await asyncio.sleep(0.2)
                             continue
 
-                    print("[queue->server] send failed, waiting for reconnect")
+                    logger.warning("[queue->server] send failed, waiting for reconnect")
                     self.connected_event.clear()
                     await asyncio.sleep(1.0)
             finally:
@@ -620,7 +631,7 @@ class SyncClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(f"[client] server connection lost/error: {exc}")
+                logger.error(f"[client] server connection lost/error: {exc}")
             finally:
                 for task in (listener_task, keepalive_task):
                     if task is not None and not task.done():
@@ -635,7 +646,7 @@ class SyncClient:
                 break
 
             wait_time = min(backoff, CLIENT_RECONNECT_MAX_BACKOFF_SECONDS)
-            print(f"[client] reconnecting in {wait_time:.1f}s")
+            logger.info(f"[client] reconnecting in {wait_time:.1f}s")
             await asyncio.sleep(wait_time)
             backoff = min(backoff * CLIENT_RECONNECT_BACKOFF_MULTIPLIER, CLIENT_RECONNECT_MAX_BACKOFF_SECONDS)
 
@@ -645,7 +656,7 @@ class SyncClient:
             try:
                 state, position = await vlc.get_state()
             except Exception as exc:
-                print(f"[client] local watcher read error: {exc}")
+                logger.error(f"[client] local watcher read error: {exc}")
                 await asyncio.sleep(LOCAL_WATCHER_ERROR_SLEEP_SECONDS)
                 continue
 
@@ -670,7 +681,7 @@ class SyncClient:
                         state,
                     )
                 except Exception as exc:
-                    print(f"[client] failed queueing playstate event: {exc}")
+                    logger.error(f"[client] failed queueing playstate event: {exc}")
             elif (
                 position is not None
                 and self.last_position is not None
@@ -679,7 +690,7 @@ class SyncClient:
                 try:
                     await self.send_event("seek", position, state if state in {"playing", "paused"} else "paused")
                 except Exception as exc:
-                    print(f"[client] failed queueing seek event: {exc}")
+                    logger.error(f"[client] failed queueing seek event: {exc}")
 
             self.last_state = state
             self.last_position = position
@@ -689,7 +700,7 @@ class SyncClient:
         self.launch_vlc()
         vlc = self._get_vlc()
         await vlc.connect()
-        print("[client] Connected to VLC Lua interface")
+        logger.info("[client] Connected to VLC Lua interface")
         await asyncio.gather(
             self.connection_supervisor(),
             self.sender_loop(),
@@ -741,9 +752,53 @@ async def async_main() -> None:
         default=None,
         help="Local Lua interface port. If omitted, auto-selects a free port.",
     )
+    
+    # Logging arguments
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        help="Path to the log file. Default is config-dir/vlcsync.log",
+    )
+    parser.add_argument(
+        "--no-log-file",
+        dest="no_log_file",
+        action="store_true",
+        help="Disable file logging.",
+    )
+    parser.add_argument(
+        "--log-level",
+        dest="log_level",
+        default="INFO",
+        help="Console log level (DEBUG, INFO, WARNING, ERROR). Default: INFO",
+    )
+    parser.add_argument(
+        "--file-log-level",
+        dest="file_log_level",
+        default="DEBUG",
+        help="File log level (DEBUG, INFO, WARNING, ERROR). Default: DEBUG",
+    )
+
     args = parser.parse_args()
 
+    # Logging setup
     config_path = _client_config_path(args.config)
+    
+    # Determine log file path
+    if args.log_file:
+        log_file_path = Path(args.log_file)
+    else:
+        # Default log file in the config directory
+        config_dir = get_vlcsync_config_dir()
+        log_file_path = config_dir / "vlcsync.log"
+
+    setup_logger(
+        name="vlcsync", # Root logger name for this package
+        log_file=log_file_path,
+        console_level=args.log_level,
+        file_level=args.file_log_level,
+        no_log_file=args.no_log_file
+    )
+
     config = load_or_create_client_config(config_path)
 
     username = _resolve_runtime_value(
