@@ -41,7 +41,8 @@ LUA_PORT_SCAN_ATTEMPTS = 200
 
 
 def get_vlcsync_config_dir() -> Path:
-    path = Path.home() / "config/vlcsync"
+    project_root = Path(__file__).resolve().parent.parent
+    path = project_root / "config"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

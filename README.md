@@ -82,17 +82,16 @@ Every person watching needs to run the client.
 ## Configuration
 
 After running the client once, a config file is created at:
-`~/.config/vlcsync/client_config.json`
+`./config/client_config.ini`
 
 You can potentiall save your details here so you don't have to type them every time:
 
-```json
-{
-  "username": "Alice",
-  "server_ip": "1.2.3.4",
-  "port": 9000,
-  "lua_port": null
-}
+```ini
+[client]
+username = Alice
+server_ip = 1.2.3.4
+port = 9000
+lua_port =
 ```
 
 Now you can just run:

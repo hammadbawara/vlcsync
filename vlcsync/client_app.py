@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import configparser
 import json
+import os
 import shutil
 import signal
 import socket
@@ -52,21 +54,35 @@ class ConfigError(Exception):
 
 
 REQUIRED_CONFIG_FIELDS = ("username", "server_ip", "port", "lua_port")
+CONFIG_SECTION = "client"
 
 
 def _client_config_path(default_path: str | None = None) -> Path:
     if default_path:
         return Path(default_path).expanduser()
-    return get_vlcsync_config_dir() / "client_config.json"
+    return get_vlcsync_config_dir() / "client_config.ini"
 
 
-def _default_config() -> dict[str, Any]:
+def _default_config() -> dict[str, str]:
     return {
         "username": generate_default_username(),
-        "server_ip": None,
-        "port": None,
-        "lua_port": None,
+        "server_ip": "",
+        "port": "",
+        "lua_port": "",
     }
+
+
+def _parse_optional_port(raw_value: str, field: str, config_path: Path) -> int | None:
+    value = raw_value.strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ConfigError(
+            f"Invalid '{field}' in config: {config_path}. Expected integer or empty value."
+        ) from exc
+    return parsed
 
 
 def _validate_config_types(config: dict[str, Any], config_path: Path) -> None:
@@ -97,40 +113,59 @@ def _validate_config_types(config: dict[str, Any], config_path: Path) -> None:
 
 def load_or_create_client_config(config_path: Path) -> dict[str, Any]:
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    parser = configparser.ConfigParser(interpolation=None)
 
     if not config_path.exists():
         defaults = _default_config()
-        config_path.write_text(json.dumps(defaults, indent=2) + "\n", encoding="utf-8")
-        config_path.write_text(json.dumps(defaults, indent=2) + "\n", encoding="utf-8")
+        parser[CONFIG_SECTION] = defaults
+        try:
+            with config_path.open("w", encoding="utf-8") as handle:
+                parser.write(handle)
+        except OSError as exc:
+            raise ConfigError(f"Unable to write config file {config_path}: {exc}") from exc
+
         logger.info(f"[config] created default config at {config_path}")
-        logger.info("[config] server_ip and port are null by default; set them in config or pass CLI args")
-        return defaults
+        logger.info("[config] server_ip and port are empty by default; set them in config or pass CLI args")
+        return {
+            "username": defaults["username"],
+            "server_ip": None,
+            "port": None,
+            "lua_port": None,
+        }
 
     try:
-        raw = config_path.read_text(encoding="utf-8")
-    except OSError as exc:
+        read_files = parser.read(config_path, encoding="utf-8")
+    except (configparser.Error, OSError) as exc:
         raise ConfigError(f"Unable to read config file {config_path}: {exc}") from exc
 
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"Invalid JSON format in config file {config_path}: {exc}") from exc
+    if not read_files:
+        raise ConfigError(f"Unable to read config file {config_path}: file was not loaded.")
 
-    if not isinstance(parsed, dict):
-        raise ConfigError(f"Invalid config format in {config_path}: expected a JSON object.")
+    if CONFIG_SECTION not in parser:
+        raise ConfigError(
+            f"Invalid config format in {config_path}: missing '[{CONFIG_SECTION}]' section."
+        )
 
-    missing_fields = [field for field in REQUIRED_CONFIG_FIELDS if field not in parsed]
+    section = parser[CONFIG_SECTION]
+
+    missing_fields = [field for field in REQUIRED_CONFIG_FIELDS if field not in section]
     if missing_fields:
         raise ConfigError(
             f"Missing required config fields in {config_path}: {', '.join(missing_fields)}"
         )
 
+    username = section.get("username", "").strip()
+    server_ip_raw = section.get("server_ip", "")
+    port_raw = section.get("port", "")
+    lua_port_raw = section.get("lua_port", "")
+
     config: dict[str, Any] = {
-        "username": parsed["username"],
-        "server_ip": parsed["server_ip"],
-        "port": parsed["port"],
-        "lua_port": parsed["lua_port"],
+        "username": username,
+        "server_ip": server_ip_raw.strip() or None,
+        "port": _parse_optional_port(port_raw, "port", config_path),
+        "lua_port": _parse_optional_port(lua_port_raw, "lua_port", config_path),
     }
+
     _validate_config_types(config, config_path)
     return config
 
@@ -266,6 +301,8 @@ class SyncClient:
 
     def install_lua_script(self) -> Path:
         source = Path(__file__).resolve().parent.parent / "vlcsync.lua"
+        if not source.exists():
+            raise RuntimeError(f"Lua script not found at {source}")
         target_dir = Path.home() / ".local/share/vlc/lua/intf"
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / "vlcsync.lua"
@@ -736,7 +773,7 @@ async def async_main() -> None:
         type=_positive_port,
         help="Server port (positional override). If omitted, config value is used.",
     )
-    parser.add_argument("--config", help="Path to client config JSON file.")
+    parser.add_argument("--config", help="Path to client config INI file.")
     parser.add_argument("--username", dest="username_opt", help="Username (overrides config and positional).")
     parser.add_argument("--server-ip", dest="server_ip_opt", help="Server IP/host (overrides config and positional).")
     parser.add_argument(
