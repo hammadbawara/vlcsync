@@ -37,7 +37,12 @@ local function set_time(seconds)
     if tonumber(vlc.misc.version():sub(1, 1)) > 2 then
         sec = sec * 1000000
     end
-    vlc.var.set(input, "time", sec)
+    -- VLC's time variable is an integer (microseconds on VLC 3+).
+    if sec ~= sec or sec == math.huge or sec == -math.huge
+        or sec >= 9223372036854775808 or sec < -9223372036854775808 then
+        return "error:bad-seek"
+    end
+    vlc.var.set(input, "time", math.floor(sec + 0.5))
     return "ok"
 end
 
